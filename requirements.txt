@@ -1,3 +1,9 @@
 matplotlib
 seaborn
 scikit-learn
+pandas
+numpy
+lightgbm
+xgboost
+catboost
+shap

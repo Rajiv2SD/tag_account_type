@@ -1,0 +1,8 @@
+
+
+# Ignore Models
+*.pkl
+catboost_info/
+
+# System files
+.DS_Store
