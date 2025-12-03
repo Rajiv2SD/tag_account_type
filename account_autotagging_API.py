@@ -1,20 +1,19 @@
 """
 account_autotagging_API.py
 
-FastAPI service for CRM account auto-tagging / propensity scoring.
-
-- Adds HTTP Basic Authentication for protected endpoints (predict).
-- Default credentials read from environment vars:
-    API_AUTH_USERNAME (default: "admin")
-    API_AUTH_PASSWORD (default: a strong default - change it!)
-
-Security NOTE: Use HTTPS in production to protect credentials in transit.
+FastAPI service implementing:
+- Hybrid deterministic rules + XGBoost model inference
+- Input validation and allowed-lists
+- Suspicious-data warnings
+- Basic HTTP authentication (env-configurable)
+- Single and batch /predict endpoints
+- /health endpoint
 """
 
-from typing import List, Optional, Tuple
-from fastapi import FastAPI, HTTPException, Depends, status
+from typing import List, Optional, Tuple, Dict, Any
+from fastapi import FastAPI, HTTPException, Depends, status, Body
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, Field, conint, confloat
+from pydantic import BaseModel, Field, conint, confloat, validator
 import joblib
 import xgboost as xgb
 import pandas as pd
@@ -25,11 +24,15 @@ import logging
 import os
 import secrets
 
-# ---------- Logging ----------
+# -------------------------
+# Logging
+# -------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("propensity_api")
+logger = logging.getLogger("account_autotagging_api")
 
-# ---------- Allowed lists (match your Streamlit selectboxes) ----------
+# -------------------------
+# Allowed lists (streamlit selectbox values)
+# -------------------------
 ALLOWED_COUNTRIES = {
     "France",
     "United Kingdom",
@@ -54,85 +57,95 @@ ALLOWED_INDUSTRIES = {
     "Healthcare",
     "Logistics, Transport & Distribution",
     "Hospitality & Leisure",
+    "Test Account"
 }
 
-# ---------- Auth config ----------
-# Default credentials (change them in production!)
+# -------------------------
+# Auth configuration
+# -------------------------
 DEFAULT_AUTH_USERNAME = "admin"
-DEFAULT_AUTH_PASSWORD = "admin123"  # change this immediately in prod
+DEFAULT_AUTH_PASSWORD = "S!tr0ngP@ssw0rd#2025"
 
 API_AUTH_USERNAME = os.getenv("API_AUTH_USERNAME", DEFAULT_AUTH_USERNAME)
 API_AUTH_PASSWORD = os.getenv("API_AUTH_PASSWORD", DEFAULT_AUTH_PASSWORD)
 
 security = HTTPBasic()
 
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    """
-    Verifies HTTP Basic credentials; raises 401 if invalid.
-    Returns the username when valid.
-    """
-    supplied_username = credentials.username
-    supplied_password = credentials.password
-
-    # Use constant-time comparison
-    is_user = secrets.compare_digest(supplied_username, API_AUTH_USERNAME)
-    is_pass = secrets.compare_digest(supplied_password, API_AUTH_PASSWORD)
-
-    if not (is_user and is_pass):
-        # Ask client for credentials
+def verify_credentials(creds: HTTPBasicCredentials = Depends(security)) -> str:
+    if not (secrets.compare_digest(creds.username, API_AUTH_USERNAME) and
+            secrets.compare_digest(creds.password, API_AUTH_PASSWORD)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
-    return supplied_username
+    return creds.username
 
-# ---------- FastAPI app ----------
+# -------------------------
+# FastAPI app
+# -------------------------
 app = FastAPI(
-    title="CRM Propensity Engine API (Authenticated)",
-    description="Predict lifecycle stage + conversion probability from account features (requires Basic Auth)",
-    version="1.3.0",
+    title="CRM Account Auto-Tagging API (Hybrid Rules + XGBoost)",
+    version="1.4.0",
+    description="Hybrid deterministic-rule + XGBoost propensity engine. Supports single & batch scoring. Protected by Basic Auth."
 )
 
-# NOTE: adjust CORS for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Pydantic models ----------
-class PredictRequest(BaseModel):
+# -------------------------
+# Pydantic models
+# -------------------------
+class AccountPayload(BaseModel):
     revenue: confloat(gt=0) = Field(..., description="Annual revenue (must be > 0)")
     employees: conint(ge=1) = Field(..., description="Number of employees (must be >= 1)")
-    country: str = Field(..., description="Country name (must be in allowed list)")
+    country: str = Field(..., description="Country (must be in allowed list)")
     industry: str = Field(..., description="Industry (must be in allowed list)")
+
+    @validator("country")
+    def country_must_be_allowed(cls, v):
+        if v not in ALLOWED_COUNTRIES:
+            raise ValueError(f"Invalid country '{v}'. Allowed: {sorted(ALLOWED_COUNTRIES)}")
+        return v
+
+    @validator("industry")
+    def industry_must_be_allowed(cls, v):
+        if v not in ALLOWED_INDUSTRIES:
+            raise ValueError(f"Invalid industry '{v}'. Allowed: {sorted(ALLOWED_INDUSTRIES)}")
+        return v
 
 class StageProb(BaseModel):
     stage: str
     probability: float
 
-class PredictResponse(BaseModel):
+class PredictResult(BaseModel):
     top_stage: str
     top_probability: float
     probabilities: List[StageProb]
     next_best_action: Optional[str] = None
-    raw_features: Optional[dict] = None
+    raw_features: Optional[Dict[str, Any]] = None
     warnings: Optional[List[str]] = None
+    logic_source: Optional[str] = None  # "Rule: ..." or "XGBoost Model"
 
-class ValidationErrorResponse(BaseModel):
-    valid: bool = False
-    errors: List[str]
-    warnings: Optional[List[str]] = None
+class BatchItemResult(BaseModel):
+    input: AccountPayload
+    result: Optional[PredictResult] = None
+    error: Optional[str] = None
 
-# ---------- Artifact loading ----------
+# -------------------------
+# Artifacts paths (same folder)
+# -------------------------
 MODEL_PATH = "propensity_engine.json"
 PREPROCESSOR_PATH = "preprocessor.joblib"
 LABEL_ENCODER_PATH = "label_encoder.joblib"
 FEATURE_NAMES_PATH = "feature_names.joblib"
 
+# Module-level caches
 model: Optional[xgb.Booster] = None
 preprocessor = None
 label_encoder = None
@@ -149,8 +162,12 @@ def load_artifacts():
 
         preprocessor = joblib.load(PREPROCESSOR_PATH)
         label_encoder = joblib.load(LABEL_ENCODER_PATH)
-        feature_names = joblib.load(FEATURE_NAMES_PATH)
-        logger.info("Loaded preprocessor, label encoder, and feature names.")
+        # feature_names may be optional, wrap in try
+        try:
+            feature_names = joblib.load(FEATURE_NAMES_PATH)
+        except Exception:
+            feature_names = None
+        logger.info("Loaded preprocessing artifacts.")
     except Exception as e:
         logger.exception("Failed to load artifacts: %s", e)
         raise
@@ -159,8 +176,10 @@ def load_artifacts():
 def startup_event():
     load_artifacts()
 
-# ---------- Feature derivation ----------
-def derive_features(revenue: float, employees: int, country: str, industry: str) -> pd.DataFrame:
+# -------------------------
+# Feature derivation (same logic as streamlit)
+# -------------------------
+def derive_features_df(revenue: float, employees: int, country: str, industry: str) -> pd.DataFrame:
     log_revenue = np.log1p(revenue)
     log_num_employees = np.log1p(employees) if employees > 0 else 0.0
     revenue_per_employee = float(revenue / employees) if employees > 0 else 0.0
@@ -207,7 +226,9 @@ def derive_features(revenue: float, employees: int, country: str, industry: str)
 
     return df
 
-# ---------- Next best action ----------
+# -------------------------
+# Next best action mapping
+# -------------------------
 def next_best_action_for_stage(stage: str) -> str:
     mapping = {
         "Target": "High Value Fit. Immediate sales outreach recommended.",
@@ -218,132 +239,174 @@ def next_best_action_for_stage(stage: str) -> str:
     }
     return mapping.get(stage, "No specific action defined for this stage.")
 
-# ---------- Payload validation helper ----------
-def validate_payload(payload: PredictRequest) -> Tuple[List[str], List[str]]:
-    """
-    Returns (errors, warnings).
-    - errors: blocking issues (invalid country/industry, numeric constraints)
-    - warnings: non-blocking suspicious combinations
-    """
+# -------------------------
+# Validation helper (non-Pydantic checks)
+# returns (errors, warnings)
+# -------------------------
+def validate_business(payload: AccountPayload) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
 
-    if payload.country not in ALLOWED_COUNTRIES:
-        errors.append(
-            f"Invalid country: '{payload.country}'. Allowed countries: {sorted(ALLOWED_COUNTRIES)}"
-        )
-    if payload.industry not in ALLOWED_INDUSTRIES:
-        errors.append(
-            f"Invalid industry: '{payload.industry}'. Allowed industries: {sorted(ALLOWED_INDUSTRIES)}"
-        )
-
+    # Numeric checks (Pydantic already does most) - double-check
     if payload.revenue <= 0:
-        errors.append("Invalid revenue: must be greater than 0.")
+        errors.append("Invalid revenue: must be > 0.")
     if payload.employees < 1:
-        errors.append("Invalid employees: must be at least 1.")
+        errors.append("Invalid employees: must be >= 1.")
 
-    # Suspicious checks
+    # Allowed lists checked by validators in AccountPayload; keep redundant safety
+    if payload.country not in ALLOWED_COUNTRIES:
+        errors.append(f"Invalid country: '{payload.country}'.")
+    if payload.industry not in ALLOWED_INDUSTRIES:
+        errors.append(f"Invalid industry: '{payload.industry}'.")
+
+    # Suspicious checks (non-blocking)
     rev = float(payload.revenue)
     emp = int(payload.employees)
     rev_per_emp = rev / emp if emp > 0 else float("inf")
 
     if rev > 1_000_000_000 and emp < 5:
-        warnings.append(
-            "Suspicious: extremely high revenue (> 1B) with very few employees (<5). Please verify."
-        )
-
+        warnings.append("Suspicious: extremely high revenue (>1B) with very few employees (<5).")
     if rev < 1_000 and emp > 1000:
-        warnings.append(
-            "Suspicious: very low revenue (<1k) with many employees (>1000). Please verify."
-        )
-
+        warnings.append("Suspicious: very low revenue (<1k) with many employees (>1000).")
     if rev_per_emp > 10_000_000:
-        warnings.append(
-            f"Suspicious: revenue per employee is very high ({rev_per_emp:,.0f}). Please verify."
-        )
-
+        warnings.append(f"Suspicious: revenue per employee is very high ({rev_per_emp:,.0f}).")
     if rev_per_emp < 100:
-        warnings.append(
-            f"Suspicious: revenue per employee is very low ({rev_per_emp:.2f}). Please verify."
-        )
+        warnings.append(f"Suspicious: revenue per employee is very low ({rev_per_emp:.2f}).")
 
     return errors, warnings
 
-# ---------- Prediction endpoint (protected by Basic Auth) ----------
-@app.post("/predict", responses={
-    200: {"model": PredictResponse},
-    400: {"model": ValidationErrorResponse},
-    401: {"description": "Unauthorized"}
-})
-def predict(payload: PredictRequest, username: str = Depends(verify_credentials)):
-    """
-    Protected endpoint: requires valid Basic Auth credentials.
-    'username' returned by verify_credentials can be used for audit/logging.
-    """
-    # Validate first:
-    errors, warnings = validate_payload(payload)
+# -------------------------
+# Hybrid rules: returns (rule_triggered: bool, logic_source: str, override_class: Optional[str])
+# Adapted from your streamlit rules
+# -------------------------
+def apply_hard_rules(revenue: float, employees: int, industry: str) -> Tuple[bool, str, Optional[str]]:
+    # Default: no rule triggered
+    # RULE 1: Test Purge (if industry contains "Test")
+    if "Test" in industry:
+        return True, "Rule: Test Artifact Purge", "Deactivated"
+
+    # RULE 2: Zombie company (high employees, very low revenue)
+    if employees > 50 and revenue < 10_000:
+        return True, "Rule: Zombie Company (High Emp / Low Rev)", "Deactivated"
+
+    # RULE 3: Enterprise Target (very high revenue)
+    if revenue > 100_000_000 and employees > 1:
+        return True, "Rule: Enterprise Whitelist (Rev > $100M)", "Target"
+
+    # RULE 4: Micro revenue (too small)
+    if revenue < 1_000:
+        return True, "Rule: Min. Revenue Threshold (Rev < $1k)", "Deactivated"
+
+    return False, "XGBoost Model", None
+
+# -------------------------
+# Core single-inference routine
+# -------------------------
+def single_predict_logic(payload: AccountPayload) -> PredictResult:
+    # Validate business rules + warnings
+    errors, warnings = validate_business(payload)
     if errors:
-        # Blocking errors
-        raise HTTPException(
-            status_code=400,
-            detail={"valid": False, "errors": errors, "warnings": warnings}
-        )
+        raise HTTPException(status_code=400, detail={"valid": False, "errors": errors, "warnings": warnings})
 
-    # proceed with inference (same as before)
-    try:
-        raw_df = derive_features(payload.revenue, payload.employees, payload.country, payload.industry)
-    except Exception as e:
-        logger.exception("Error deriving features: %s", e)
-        raise HTTPException(status_code=400, detail=f"Feature derivation failed: {e}")
+    # Determine if any hard rule triggers
+    rule_triggered, logic_source, override_class = apply_hard_rules(payload.revenue, payload.employees, payload.industry)
 
-    try:
-        X_processed = preprocessor.transform(raw_df)
-    except Exception as e:
-        logger.exception("Preprocessing transform error: %s", e)
-        raise HTTPException(status_code=400, detail=f"Preprocessing failed: {e}")
+    # Prepare class labels
+    class_labels = list(label_encoder.classes_)
 
-    try:
-        dtest = xgb.DMatrix(X_processed)
-        preds = model.predict(dtest)
-        if preds.ndim == 2 and preds.shape[0] == 1:
-            probs = preds[0].tolist()
-        elif preds.ndim == 1:
-            probs = preds.tolist()
-        else:
-            probs = preds.reshape(-1).tolist()
-    except Exception as e:
-        logger.exception("Model prediction error: %s", e)
-        raise HTTPException(status_code=500, detail=f"Model prediction failed: {e}")
+    if rule_triggered:
+        # Build deterministic probability vector
+        probs = np.zeros(len(class_labels), dtype=float)
+        if override_class not in class_labels:
+            # If override class not found, it's an application error — return 500
+            raise HTTPException(status_code=500, detail=f"Override class '{override_class}' not present in label encoder classes.")
+        idx = class_labels.index(override_class)
+        probs[idx] = 1.0
+    else:
+        # Run ML model
+        raw_df = derive_features_df(payload.revenue, payload.employees, payload.country, payload.industry)
+        try:
+            X_processed = preprocessor.transform(raw_df)
+        except Exception as e:
+            logger.exception("Preprocessor transform failed: %s", e)
+            raise HTTPException(status_code=400, detail=f"Preprocessing failed: {e}")
 
-    try:
-        class_labels = label_encoder.classes_
-        items = [{"stage": str(s), "probability": float(p)} for s, p in zip(class_labels, probs)]
-        items_sorted = sorted(items, key=lambda x: x["probability"], reverse=True)
-        top_stage = items_sorted[0]["stage"]
-        top_probability = items_sorted[0]["probability"]
-    except Exception as e:
-        logger.exception("Error mapping labels: %s", e)
-        raise HTTPException(status_code=500, detail=f"Label mapping failed: {e}")
+        try:
+            dtest = xgb.DMatrix(X_processed)
+            preds = model.predict(dtest)
+            # preds shape handling
+            if preds.ndim == 2 and preds.shape[0] == 1:
+                probs = preds[0]
+            elif preds.ndim == 1:
+                probs = preds
+            else:
+                probs = preds.reshape(-1)
+        except Exception as e:
+            logger.exception("Model prediction failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"Model prediction failed: {e}")
 
-    # audit log example
-    logger.info("User '%s' invoked /predict for country=%s, industry=%s", username, payload.country, payload.industry)
+    # Map probabilities to stages
+    items = [{"stage": s, "probability": float(p)} for s, p in zip(class_labels, probs)]
+    items_sorted = sorted(items, key=lambda x: x["probability"], reverse=True)
+    top_stage = items_sorted[0]["stage"]
+    top_probability = items_sorted[0]["probability"]
 
-    response = PredictResponse(
+    # raw_features for debugging
+    raw_features_df = derive_features_df(payload.revenue, payload.employees, payload.country, payload.industry)
+    raw_features = raw_features_df.to_dict(orient="records")[0]
+
+    result = PredictResult(
         top_stage=top_stage,
         top_probability=float(top_probability),
         probabilities=[StageProb(stage=i["stage"], probability=i["probability"]) for i in items_sorted],
         next_best_action=next_best_action_for_stage(top_stage),
-        raw_features=raw_df.to_dict(orient="records")[0],
-        warnings=warnings if warnings else None
+        raw_features=raw_features,
+        warnings=warnings if warnings else None,
+        logic_source=logic_source
     )
 
-    return response
+    return result
 
-# ---------- Health endpoint (public) ----------
-@app.get("/health")
+# -------------------------
+# Endpoints
+# -------------------------
+@app.get("/health", tags=["health"])
 def health():
     return {"status": "ok"}
 
-# ---------- Run ----------
+@app.post("/predict", response_model=PredictResult, tags=["predict"])
+def predict(payload: AccountPayload, username: str = Depends(verify_credentials)):
+    """
+    Single account prediction (protected). Returns PredictResult.
+    """
+    logger.info("User '%s' called /predict for country=%s industry=%s", username, payload.country, payload.industry)
+    return single_predict_logic(payload)
+
+@app.post("/predict/batch", response_model=List[BatchItemResult], tags=["predict"])
+def predict_batch(payloads: List[AccountPayload] = Body(..., example=[
+    {"revenue": 1500000, "employees": 50, "country": "United Kingdom", "industry": "Manufacturing"},
+    {"revenue": 1000, "employees": 2, "country": "France", "industry": "Test Account"}
+]), username: str = Depends(verify_credentials)):
+    """
+    Batch scoring endpoint. Returns per-item result or error.
+    """
+    logger.info("User '%s' called /predict/batch with %d items", username, len(payloads))
+    responses: List[BatchItemResult] = []
+    for p in payloads:
+        try:
+            res = single_predict_logic(p)
+            responses.append(BatchItemResult(input=p, result=res, error=None))
+        except HTTPException as he:
+            # Preserve HTTPException detail for the single item
+            err_detail = he.detail if isinstance(he.detail, (str, dict, list)) else str(he.detail)
+            responses.append(BatchItemResult(input=p, result=None, error=str(err_detail)))
+        except Exception as e:
+            logger.exception("Unhandled error for batch item: %s", e)
+            responses.append(BatchItemResult(input=p, result=None, error=str(e)))
+    return responses
+
+# -------------------------
+# Run (dev)
+# -------------------------
 if __name__ == "__main__":
     uvicorn.run("account_autotagging_API:app", host="127.0.0.1", port=8000, reload=False)
