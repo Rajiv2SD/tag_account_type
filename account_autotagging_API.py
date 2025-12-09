@@ -1,19 +1,8 @@
-"""
-account_autotagging_API.py
-
-FastAPI service implementing:
-- Hybrid deterministic rules + XGBoost model inference
-- Input validation and allowed-lists
-- Suspicious-data warnings
-- Basic HTTP authentication (env-configurable)
-- Single and batch /predict endpoints
-- /health endpoint
-"""
 
 from typing import List, Optional, Tuple, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, status, Body
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, Field, conint, confloat, validator
+from pydantic import BaseModel, Field, field_validator
 import joblib
 import xgboost as xgb
 import pandas as pd
@@ -102,18 +91,18 @@ app.add_middleware(
 # Pydantic models
 # -------------------------
 class AccountPayload(BaseModel):
-    revenue: confloat(gt=0) = Field(..., description="Annual revenue (must be > 0)")
-    employees: conint(ge=1) = Field(..., description="Number of employees (must be >= 1)")
+    revenue: float = Field(..., gt=0, description="Annual revenue (must be > 0)")
+    employees: int = Field(..., ge=1, description="Number of employees (must be >= 1)")
     country: str = Field(..., description="Country (must be in allowed list)")
     industry: str = Field(..., description="Industry (must be in allowed list)")
 
-    @validator("country")
+    @field_validator("country")
     def country_must_be_allowed(cls, v):
         if v not in ALLOWED_COUNTRIES:
             raise ValueError(f"Invalid country '{v}'. Allowed: {sorted(ALLOWED_COUNTRIES)}")
         return v
 
-    @validator("industry")
+    @field_validator("industry")
     def industry_must_be_allowed(cls, v):
         if v not in ALLOWED_INDUSTRIES:
             raise ValueError(f"Invalid industry '{v}'. Allowed: {sorted(ALLOWED_INDUSTRIES)}")
